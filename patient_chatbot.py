@@ -19,6 +19,7 @@ from langchain.schema.runnable.config import RunnableConfig
 from patient_data_processor import patient_processor
 from galileo import GalileoLogger
 from galileo_core.schemas.shared.document import Document
+from guardrails import MedicalGuardrails, GuardrailResult
 
 # Initialize colorama for cross-platform colored output
 init()
@@ -29,10 +30,11 @@ load_dotenv(os.path.expanduser("~/.config/secrets/myapps.env"), override=False)
 # 2) then load per-app .env (if present) to override selectively
 load_dotenv(find_dotenv(usecwd=True), override=True)
 
-# Initialize Galileo logger once at module level
+# Initialize Galileo logger and guardrails once at module level
 galileo_logger = None
 galileo_project = None
 galileo_log_stream = None
+medical_guardrails = None
 
 # Initialize Galileo logger if configuration is available
 api_key = os.getenv("GALILEO_API_KEY")
@@ -48,9 +50,12 @@ if all([api_key, project, log_stream]):
     galileo_project = project
     galileo_log_stream = log_stream
     galileo_logger = GalileoLogger(project=project, log_stream=log_stream)
-    print(Fore.GREEN + "Galileo logger initialized successfully." + Style.RESET_ALL)
+    # Use lenient mode for better user experience while maintaining safety
+    medical_guardrails = MedicalGuardrails(galileo_logger, strict_mode=False)
+    print(Fore.GREEN + "Galileo logger and medical guardrails initialized successfully (lenient mode)." + Style.RESET_ALL)
 else:
-    print("Warning: Missing Galileo configuration. Logging will be disabled.")
+    print("Warning: Missing Galileo configuration. Logging and guardrails will be disabled.")
+    medical_guardrails = MedicalGuardrails(strict_mode=False)  # Initialize without Galileo logging
 
 def extract_patient_name(query: str) -> str:
     """Extract patient name from query using OpenAI."""
@@ -255,6 +260,27 @@ async def on_message(message: cl.Message):
     start_time = time.time()
 
     try:
+        # Run input safety check first
+        if medical_guardrails:
+            input_safety_result = medical_guardrails.check_input_safety(user_query)
+            if not input_safety_result.passed:
+                error_msg = f"⚠️ Safety Check Failed: {input_safety_result.message}\n\nI cannot process this request due to safety concerns. Please rephrase your question or consult a healthcare provider directly."
+                await cl.Message(content=error_msg).send()
+                
+                # Log the blocked request to Galileo
+                if galileo_logger:
+                    galileo_logger.start_trace(
+                        input=user_query,
+                        name=f"BLOCKED_REQUEST: {user_query[:50]}...",
+                        tags=["patient", "blocked", "safety_check"]
+                    )
+                    galileo_logger.conclude(
+                        output={"blocked": True, "reason": input_safety_result.message},
+                        duration_ns=int((time.time() - start_time) * 1000000),
+                        status_code=403
+                    )
+                    galileo_logger.flush()
+                return
         if galileo_logger:
             print(f"Starting Galileo trace for query: {user_query[:50]}...")
             galileo_logger.start_trace(
@@ -347,20 +373,61 @@ async def on_message(message: cl.Message):
         response = chain.invoke({"input": full_input})
         llm_end_time = time.time()
         
+        # Run output safety checks
+        if medical_guardrails:
+            # Prepare context for safety checks
+            patient_context = "\n".join([doc["content"] for doc in patient_records]) if patient_records else ""
+            
+            # Run comprehensive safety checks
+            safety_results = medical_guardrails.run_comprehensive_check(
+                user_input=user_query,
+                response=response,
+                patient_info=patient_context,
+                context=context
+            )
+            
+            # Check if response should be blocked
+            should_block, block_reason = medical_guardrails.should_block_response(safety_results)
+            
+            if should_block:
+                error_msg = f"⚠️ Safety Check Failed: {block_reason}\n\nI cannot provide this response due to safety concerns. Please consult a healthcare provider for personalized medical advice."
+                await cl.Message(content=error_msg).send()
+                
+                # Log the blocked response to Galileo
+                if galileo_logger:
+                    galileo_logger.conclude(
+                        output={"blocked": True, "reason": block_reason, "safety_results": {k: v.to_dict() for k, v in safety_results.items()}},
+                        duration_ns=int((time.time() - start_time) * 1000000),
+                        status_code=403
+                    )
+                    galileo_logger.flush()
+                return
+            
+            # Log safety check results
+            safety_summary = medical_guardrails.get_safety_summary(safety_results)
+            print(Fore.CYAN + f"Safety Check Results: {safety_summary}" + Style.RESET_ALL)
+        
         if galileo_logger:
             print(f"Adding LLM span to Galileo trace...")
+            metadata = {
+                "type": "health_bot_response",
+                "patient_name": patient_name or "",
+                "has_patient_records": str(bool(patient_records)),
+                "has_medication_info": str(bool(medication_info))
+            }
+            
+            # Add safety check results to metadata if available
+            if medical_guardrails and 'safety_results' in locals():
+                metadata["safety_summary"] = medical_guardrails.get_safety_summary(safety_results)
+                metadata["all_safety_checks_passed"] = str(all(result.passed for result in safety_results.values()))
+            
             galileo_logger.add_llm_span(
                 input=full_input,
                 output=response,
                 name="Health Bot Response",
                 model="gpt-4o",
                 duration_ns=int((llm_end_time - llm_start_time) * 1000000),
-                metadata={
-                    "type": "health_bot_response",
-                    "patient_name": patient_name or "",
-                    "has_patient_records": str(bool(patient_records)),
-                    "has_medication_info": str(bool(medication_info))
-                }
+                metadata=metadata
             )
             print(Fore.GREEN + "LLM span added successfully." + Style.RESET_ALL)
 
