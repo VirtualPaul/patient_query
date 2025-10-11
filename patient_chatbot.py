@@ -5,6 +5,7 @@ based on their medical history using OpenAI embeddings and in-memory similarity 
 """
 
 import os
+import re
 import time
 from typing import cast, List, Dict, Any
 from dotenv import load_dotenv, find_dotenv
@@ -96,6 +97,84 @@ if all([api_key, project, log_stream]):
         protect_enabled = False
 else:
     print("Warning: Missing Galileo configuration. Logging and protection will be disabled.")
+
+def redact_phi(text: str, detected_pii_types: List[str] = None) -> str:
+    """
+    Redact PHI (Protected Health Information) from text.
+    Uses pattern matching to identify and mask sensitive information.
+    """
+    redacted_text = text
+    redactions_made = []
+    
+    # Social Security Numbers (XXX-XX-XXXX)
+    ssn_pattern = r'\b\d{3}-\d{2}-\d{4}\b'
+    if re.search(ssn_pattern, redacted_text):
+        redacted_text = re.sub(ssn_pattern, '[SSN REDACTED]', redacted_text)
+        redactions_made.append('SSN')
+    
+    # Alternative SSN format (XXXXXXXXX)
+    ssn_pattern2 = r'\b\d{9}\b'
+    if re.search(ssn_pattern2, redacted_text):
+        redacted_text = re.sub(ssn_pattern2, '[SSN REDACTED]', redacted_text)
+        if 'SSN' not in redactions_made:
+            redactions_made.append('SSN')
+    
+    # Credit Card Numbers (groups of 4 digits)
+    cc_pattern = r'\b(?:\d{4}[-\s]?){3}\d{4}\b'
+    if re.search(cc_pattern, redacted_text):
+        redacted_text = re.sub(cc_pattern, '[CREDIT CARD REDACTED]', redacted_text)
+        redactions_made.append('Credit Card')
+    
+    # Phone Numbers (various formats)
+    phone_patterns = [
+        r'\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b',  # XXX-XXX-XXXX
+        r'\(\d{3}\)\s*\d{3}[-.\s]?\d{4}',       # (XXX) XXX-XXXX
+        r'\+1[-.\s]?\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b'  # +1-XXX-XXX-XXXX
+    ]
+    for pattern in phone_patterns:
+        if re.search(pattern, redacted_text):
+            redacted_text = re.sub(pattern, '[PHONE REDACTED]', redacted_text)
+            if 'Phone Number' not in redactions_made:
+                redactions_made.append('Phone Number')
+    
+    # Email Addresses
+    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
+    if re.search(email_pattern, redacted_text):
+        redacted_text = re.sub(email_pattern, '[EMAIL REDACTED]', redacted_text)
+        redactions_made.append('Email')
+    
+    # Street Addresses (basic pattern - number followed by street name)
+    address_pattern = r'\b\d{1,5}\s+[A-Z][a-z]+\s+(Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way)\b'
+    if re.search(address_pattern, redacted_text, re.IGNORECASE):
+        redacted_text = re.sub(address_pattern, '[ADDRESS REDACTED]', redacted_text, flags=re.IGNORECASE)
+        redactions_made.append('Address')
+    
+    # Medical Record Numbers (MRN) - common patterns
+    mrn_pattern = r'\bMRN[:\s#]*\d{6,10}\b'
+    if re.search(mrn_pattern, redacted_text, re.IGNORECASE):
+        redacted_text = re.sub(mrn_pattern, '[MRN REDACTED]', redacted_text, flags=re.IGNORECASE)
+        redactions_made.append('Medical Record Number')
+    
+    # Bank Account Numbers (8-17 digits)
+    bank_pattern = r'\b(?:account|acct)[:\s#]*\d{8,17}\b'
+    if re.search(bank_pattern, redacted_text, re.IGNORECASE):
+        redacted_text = re.sub(bank_pattern, '[ACCOUNT REDACTED]', redacted_text, flags=re.IGNORECASE)
+        redactions_made.append('Bank Account')
+    
+    # Date of Birth patterns (MM/DD/YYYY or similar)
+    dob_patterns = [
+        r'\b(?:DOB|Date of Birth)[:\s]*\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\b',
+        r'\b\d{1,2}[-/]\d{1,2}[-/]\d{4}\b(?=\s*(?:birth|DOB))'
+    ]
+    for pattern in dob_patterns:
+        if re.search(pattern, redacted_text, re.IGNORECASE):
+            redacted_text = re.sub(pattern, '[DOB REDACTED]', redacted_text, flags=re.IGNORECASE)
+            if 'Date of Birth' not in redactions_made:
+                redactions_made.append('Date of Birth')
+    
+    print(f"[PHI Redaction] Made {len(redactions_made)} redactions: {', '.join(redactions_made) if redactions_made else 'None'}")
+    
+    return redacted_text
 
 def extract_patient_name(query: str) -> str:
     """Extract patient name from query using OpenAI."""
@@ -346,7 +425,8 @@ async def on_message(message: cl.Message):
         # Get user's guardrails preference from session
         guardrails_enabled = cl.user_session.get("guardrails_enabled", protect_enabled)
 
-        # Apply input protection guardrails
+        # Apply input protection guardrails (only when enabled by user)
+        # When guardrails are OFF, input validation is skipped
         if protect_enabled and guardrails_enabled:
             try:
                 print(Fore.CYAN + "🛡️  Checking input..." + Style.RESET_ALL)
@@ -365,14 +445,68 @@ async def on_message(message: cl.Message):
                     print(f"DEBUG: Protect response trace_metadata: {protect_response.trace_metadata}")
                 
                 if protect_response and protect_response.status == "triggered":
-                    # Use the text from the response (from OverrideAction choices)
+                    # Generate more descriptive response based on what was detected
                     safe_msg = protect_response.text or "Please rephrase your question."
                     
-                    print(Fore.YELLOW + f"⚠️  Input blocked: {safe_msg}" + Style.RESET_ALL)
-                    await cl.Message(content=f"🛡️ {safe_msg}").send()
+                    # Extract more context from trace_metadata if available
+                    detailed_msg = safe_msg
+                    if protect_response.trace_metadata:
+                        metadata = protect_response.trace_metadata
+                        print(f"DEBUG: Metadata keys: {metadata.keys() if metadata else 'None'}")
+                        
+                        # Check which guardrail was triggered and provide specific guidance
+                        if 'galileo_scores' in metadata:
+                            scores = metadata['galileo_scores']
+                            
+                            # Check for prompt injection
+                            if 'prompt_injection' in scores and scores['prompt_injection']:
+                                detected_types = scores['prompt_injection']
+                                detailed_msg = f"""🛡️ **Security Alert: Unusual Request Pattern Detected**
+
+I've detected what appears to be an attempt to manipulate my behavior through: **{', '.join(detected_types)}**
+
+For your safety and mine, I can only respond to genuine medical questions about:
+- Health symptoms and conditions
+- Medication information and interactions
+- General medical guidance
+- Patient records (when appropriate)
+
+Please rephrase your question as a straightforward medical inquiry."""
+                            
+                            # Check for toxicity
+                            elif 'input_toxicity' in scores and scores['input_toxicity'] > 0.5:
+                                toxicity_score = scores['input_toxicity']
+                                detailed_msg = f"""🛡️ **Content Moderation Alert**
+
+Your message appears to contain inappropriate or disrespectful language (confidence: {toxicity_score:.0%}).
+
+As a healthcare assistant, I'm here to provide respectful and professional medical guidance. 
+
+Please rephrase your question in a more appropriate manner, and I'll be happy to help you with your medical inquiry."""
+                            
+                            # Check for PII
+                            elif 'input_pii' in scores and scores['input_pii']:
+                                detected_pii = scores['input_pii']
+                                pii_types = ', '.join([pii_type.replace('_', ' ').title() for pii_type in detected_pii])
+                                detailed_msg = f"""🛡️ **Privacy Protection Alert**
+
+I've detected potentially sensitive personal information in your message: **{pii_types}**
+
+For your privacy and security, please avoid sharing:
+- Social Security Numbers
+- Credit card information
+- Detailed addresses
+- Phone numbers  
+- Email addresses in detail
+- Financial account numbers
+
+You can ask about your medical records using just your name, or ask general health questions without including sensitive personal details."""
+                    
+                    print(Fore.YELLOW + f"⚠️  Input blocked: {detailed_msg}" + Style.RESET_ALL)
+                    await cl.Message(content=detailed_msg).send()
                     
                     if galileo_logger:
-                        galileo_logger.conclude(output=safe_msg, duration_ns=int((time.time() - start_time) * 1000000), status_code=200)
+                        galileo_logger.conclude(output=detailed_msg, duration_ns=int((time.time() - start_time) * 1000000), status_code=200)
                         galileo_logger.flush()
                     return
                     
@@ -494,7 +628,8 @@ async def on_message(message: cl.Message):
             if contraindication_analysis:
                 response += f"\n\n**Important Safety Check:**\n{contraindication_analysis}"
         
-        # Apply output protection guardrails
+        # Apply output protection guardrails (only when enabled by user)
+        # When guardrails are OFF, final_response will be the unmodified response
         final_response = response
         if protect_enabled and guardrails_enabled:
             try:
@@ -508,8 +643,53 @@ async def on_message(message: cl.Message):
                 )
                 
                 if protect_resp and protect_resp.status == "triggered":
-                    # Use the text from the response (from OverrideAction choices)
-                    final_response = protect_resp.text or "I apologize, please consult a healthcare professional."
+                    # Generate more descriptive response based on what was detected in output
+                    safe_output = protect_resp.text or "I apologize, please consult a healthcare professional."
+                    
+                    # Extract more context from trace_metadata if available
+                    detailed_output = safe_output
+                    if protect_resp.trace_metadata:
+                        metadata = protect_resp.trace_metadata
+                        print(f"DEBUG: Output metadata keys: {metadata.keys() if metadata else 'None'}")
+                        
+                        # Check which guardrail was triggered and provide specific guidance
+                        if 'galileo_scores' in metadata:
+                            scores = metadata['galileo_scores']
+                            
+                            # Check for PII in output (only runs when guardrails are enabled)
+                            if 'output_pii' in scores and scores['output_pii']:
+                                detected_pii = scores['output_pii']
+                                pii_types = ', '.join([pii_type.replace('_', ' ').title() for pii_type in detected_pii])
+                                
+                                # Redact PHI from the response (preserves useful content while masking sensitive info)
+                                redacted_response = redact_phi(response, detected_pii)
+                                
+                                # Add a notice about redaction at the beginning
+                                privacy_notice = f"""🛡️ **Privacy Protection Active**
+
+*Sensitive information has been automatically redacted from this response for your protection.*
+*Detected: {pii_types}*
+
+---
+
+"""
+                                detailed_output = privacy_notice + redacted_response
+                                print(Fore.YELLOW + f"[PHI Protection] Redacted {pii_types} from output" + Style.RESET_ALL)
+                            
+                            # Check for toxicity in output
+                            elif 'output_toxicity' in scores and scores['output_toxicity'] > 0.5:
+                                toxicity_score = scores['output_toxicity']
+                                detailed_output = f"""🛡️ **Content Safety Notice**
+
+I apologize, but my initial response contained language that didn't meet professional healthcare communication standards (confidence: {toxicity_score:.0%}).
+
+Let me provide you with appropriate medical guidance instead. Could you please:
+- Rephrase your question if needed
+- Let me know what specific information would be most helpful
+
+I'm here to provide respectful, professional medical assistance."""
+                    
+                    final_response = detailed_output
                     print(Fore.YELLOW + f"⚠️  Output modified for safety" + Style.RESET_ALL)
                 else:
                     print(Fore.GREEN + "✅ Output passed" + Style.RESET_ALL)
